@@ -12,6 +12,7 @@ dependencies = [
     "paddleocr[doc-parser]>=3.5",
     "paddlepaddle>=3.0",
     "PyMuPDF>=1.24",
+    "markitdown[all]>=0.1",
 ]
 
 [project.optional-dependencies]
