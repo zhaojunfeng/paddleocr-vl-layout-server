@@ -34,7 +34,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File as FastAPIFile
+from fastapi import Depends, FastAPI, Header, UploadFile, File as FastAPIFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -46,6 +46,7 @@ JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", "3600"))
 SCANNED_PDF_CHAR_THRESHOLD = int(os.environ.get("SCANNED_PDF_CHAR_THRESHOLD", "50"))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
 ARCHIVE_RESULT_TTL_SECONDS = int(os.environ.get("ARCHIVE_RESULT_TTL_SECONDS", str(7 * 24 * 3600)))
+API_TOKEN = os.environ.get("API_TOKEN", "")
 
 # ─── PaddleOCRVL lazy init ──────────────────────────────────────────
 _pipeline = None
@@ -60,6 +61,19 @@ def get_pipeline():
             vl_rec_server_url=VLLM_SERVER_URL,
         )
     return _pipeline
+
+
+# ─── Auth ─────────────────────────────────────────────────────────
+
+async def verify_token(authorization: str = Header(None)):
+    if not API_TOKEN:
+        return  # no token configured, skip verification
+    if not authorization:
+        return JSONResponse(status_code=401, content={"error": "Missing Authorization header"})
+    # Accept "Bearer <token>" or raw token
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != API_TOKEN:
+        return JSONResponse(status_code=403, content={"error": "Invalid token"})
 
 
 # ─── Request / Response Models ──────────────────────────────────────
@@ -839,7 +853,11 @@ async def lifespan(app: FastAPI):
     executor.shutdown(wait=False)
 
 
-app = FastAPI(title="PaddleOCR-VL Layout Parsing Server", lifespan=lifespan)
+app = FastAPI(
+    title="PaddleOCR-VL Layout Parsing Server",
+    lifespan=lifespan,
+    dependencies=[Depends(verify_token)],
+)
 
 
 @app.post("/layout-parsing")

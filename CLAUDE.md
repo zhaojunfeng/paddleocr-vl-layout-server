@@ -54,6 +54,7 @@ python deep_compare.py <file.pdf|file.png> [--aistudio]
 | `SCANNED_PDF_CHAR_THRESHOLD` | `50` | Text char threshold for scanned PDF detection |
 | `UPLOAD_DIR` | `./uploads` | Base directory for archive extraction and results |
 | `ARCHIVE_RESULT_TTL_SECONDS` | `604800` (7 days) | Archive result zip expiry time |
+| `API_TOKEN` | `""` (empty = disabled) | Bearer token for API auth |
 
 ## Common Gotchas
 
