@@ -16,9 +16,11 @@ Usage:
 import asyncio
 import base64
 import copy
+import hashlib
 import io
 import json
 import os
+import secrets
 import shutil
 import tarfile
 import tempfile
@@ -30,11 +32,13 @@ import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Optional
 
 import cv2
+import jwt
 import numpy as np
-from fastapi import Depends, FastAPI, Header, UploadFile, File as FastAPIFile
+from fastapi import Depends, FastAPI, Header, Request, UploadFile, File as FastAPIFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -46,7 +50,9 @@ JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", "3600"))
 SCANNED_PDF_CHAR_THRESHOLD = int(os.environ.get("SCANNED_PDF_CHAR_THRESHOLD", "50"))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
 ARCHIVE_RESULT_TTL_SECONDS = int(os.environ.get("ARCHIVE_RESULT_TTL_SECONDS", str(7 * 24 * 3600)))
-API_TOKEN = os.environ.get("API_TOKEN", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+USER_DB_PATH = os.environ.get("USER_DB_PATH", "user.json")
+ADMIN_EMAIL = "admin@ionestep.com"
 
 # ─── PaddleOCRVL lazy init ──────────────────────────────────────────
 _pipeline = None
@@ -65,15 +71,92 @@ def get_pipeline():
 
 # ─── Auth ─────────────────────────────────────────────────────────
 
-async def verify_token(authorization: str = Header(None)):
-    if not API_TOKEN:
-        return  # no token configured, skip verification
+_user_db_lock = threading.Lock()
+
+
+def _load_users() -> dict:
+    if not os.path.exists(USER_DB_PATH):
+        return {}
+    with open(USER_DB_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_users(users: dict):
+    with open(USER_DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+
+
+def _ensure_admin():
+    users = _load_users()
+    if ADMIN_EMAIL not in users:
+        users[ADMIN_EMAIL] = {
+            "salt": secrets.token_hex(16),
+            "role": "admin",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_users(users)
+        print(f"[auth] Created admin user: {ADMIN_EMAIL}")
+    # Always print admin token at startup for convenience
+    token, _ = create_token(ADMIN_EMAIL)
+    print(f"[auth] Admin token: {token}")
+
+
+def _derive_key(salt: str) -> bytes:
+    return hashlib.sha256((JWT_SECRET + salt).encode()).digest()
+
+
+def create_token(email: str, expires_in: int | None = None) -> tuple[str, str | None]:
+    """Create JWT for user. Returns (token, expires_at_iso_or_None)."""
+    users = _load_users()
+    if email not in users:
+        raise ValueError(f"User not found: {email}")
+    salt = users[email]["salt"]
+    payload = {"email": email, "salt": salt, "iat": datetime.now(timezone.utc)}
+    expires_at = None
+    if expires_in is not None and expires_in > 0:
+        exp_time = datetime.now(timezone.utc).timestamp() + expires_in
+        payload["exp"] = exp_time
+        expires_at = datetime.fromtimestamp(exp_time, tz=timezone.utc).isoformat()
+    token = jwt.encode(payload, _derive_key(salt), algorithm="HS256")
+    return token, expires_at
+
+
+async def verify_token(request: Request, authorization: str = Header(None)):
     if not authorization:
         return JSONResponse(status_code=401, content={"error": "Missing Authorization header"})
-    # Accept "Bearer <token>" or raw token
     token = authorization.removeprefix("Bearer ").strip()
-    if token != API_TOKEN:
+    # Decode without verification to get email
+    try:
+        unverified = jwt.decode(token, options={"verify_signature": False})
+    except jwt.DecodeError:
+        return JSONResponse(status_code=401, content={"error": "Invalid token format"})
+    email = unverified.get("email")
+    token_salt = unverified.get("salt")
+    if not email or not token_salt:
+        return JSONResponse(status_code=401, content={"error": "Missing email or salt in token"})
+    # Check user exists and salt matches
+    users = _load_users()
+    if email not in users:
+        return JSONResponse(status_code=401, content={"error": "User not found"})
+    if users[email]["salt"] != token_salt:
+        return JSONResponse(status_code=401, content={"error": "Token revoked"})
+    # Verify signature and expiry
+    try:
+        jwt.decode(token, _derive_key(token_salt), algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return JSONResponse(status_code=401, content={"error": "Token expired"})
+    except jwt.InvalidSignatureError:
+        return JSONResponse(status_code=403, content={"error": "Invalid signature"})
+    except jwt.DecodeError:
         return JSONResponse(status_code=403, content={"error": "Invalid token"})
+    # Attach email to request state for admin endpoints
+    request.state.user_email = email
+
+
+def _require_admin(request: Request):
+    email = getattr(request.state, "user_email", None)
+    if email != ADMIN_EMAIL:
+        return JSONResponse(status_code=403, content={"error": "Admin access required"})
 
 
 # ─── Request / Response Models ──────────────────────────────────────
@@ -846,6 +929,7 @@ def _cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
+    _ensure_admin()
     cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
     cleanup_thread.start()
     yield
@@ -1042,6 +1126,76 @@ async def archive_download(job_id: str):
         media_type="application/zip",
         filename=f"{job['archive_name']}_result.zip",
     )
+
+
+# ─── Auth Admin Endpoints ────────────────────────────────────────
+
+class TokenRequest(BaseModel):
+    email: str
+    expires_in: Optional[int] = None  # seconds, None = never expires
+
+
+@app.post("/auth/token")
+async def auth_create_token(req: TokenRequest, request: Request):
+    admin_err = _require_admin(request)
+    if admin_err:
+        return admin_err
+    try:
+        # Create user if not exists
+        users = _load_users()
+        if req.email not in users:
+            users[req.email] = {
+                "salt": secrets.token_hex(16),
+                "role": "user",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _save_users(users)
+        token, expires_at = create_token(req.email, req.expires_in)
+        return {"email": req.email, "token": token, "expires_at": expires_at}
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+@app.post("/auth/token/refresh")
+async def auth_refresh_token(req: TokenRequest, request: Request):
+    admin_err = _require_admin(request)
+    if admin_err:
+        return admin_err
+    users = _load_users()
+    if req.email not in users:
+        return JSONResponse(status_code=404, content={"error": "User not found"})
+    # Generate new salt to revoke old tokens
+    users[req.email]["salt"] = secrets.token_hex(16)
+    _save_users(users)
+    token, expires_at = create_token(req.email, req.expires_in)
+    return {"email": req.email, "token": token, "expires_at": expires_at}
+
+
+@app.delete("/auth/token/{email}")
+async def auth_delete_user(email: str, request: Request):
+    admin_err = _require_admin(request)
+    if admin_err:
+        return admin_err
+    users = _load_users()
+    if email not in users:
+        return JSONResponse(status_code=404, content={"error": "User not found"})
+    if email == ADMIN_EMAIL:
+        return JSONResponse(status_code=400, content={"error": "Cannot delete admin user"})
+    del users[email]
+    _save_users(users)
+    return {"email": email, "status": "deleted"}
+
+
+@app.get("/auth/users")
+async def auth_list_users(request: Request):
+    admin_err = _require_admin(request)
+    if admin_err:
+        return admin_err
+    users = _load_users()
+    return [
+        {"email": email, "role": info["role"], "created_at": info["created_at"]}
+        for email, info in users.items()
+    ]
 
 
 if __name__ == "__main__":

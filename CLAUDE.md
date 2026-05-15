@@ -42,6 +42,7 @@ python deep_compare.py <file.pdf|file.png> [--aistudio]
 - `process_single_file()` supports both base64 (`file`+`fileType`) and server-side path (`filePath`) input
 - Batch processing uses in-memory `BatchJobStore` with `ThreadPoolExecutor` (no external deps like Redis)
 - Archive processing uses `ArchiveJobStore`, processes files via `process_single_file(filePath=...)`, saves results as zip
+- JWT auth with per-user salts in `user.json`; admin user `admin@ionestep.com` preset at startup; gen tokens via `python gen_token.py <email> [expires_in]`
 
 ## Environment Variables
 
@@ -54,7 +55,8 @@ python deep_compare.py <file.pdf|file.png> [--aistudio]
 | `SCANNED_PDF_CHAR_THRESHOLD` | `50` | Text char threshold for scanned PDF detection |
 | `UPLOAD_DIR` | `./uploads` | Base directory for archive extraction and results |
 | `ARCHIVE_RESULT_TTL_SECONDS` | `604800` (7 days) | Archive result zip expiry time |
-| `API_TOKEN` | `""` (empty = disabled) | Bearer token for API auth |
+| `JWT_SECRET` | random at startup | JWT signing secret (set for persistence across restarts) |
+| `USER_DB_PATH` | `user.json` | Path to user database file |
 
 ## Common Gotchas
 
