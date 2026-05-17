@@ -1,0 +1,14 @@
+fastapi>=0.100
+uvicorn>=0.20
+pydantic>=2.0
+opencv-contrib-python>=4.5
+numpy>=1.24
+paddleocr[doc-parser]>=3.5
+paddlepaddle>=3.0
+PyMuPDF>=1.24
+markitdown[all]>=0.1
+PyJWT>=2.8
+
+[dev]
+pytest>=7.0
+httpx>=0.24

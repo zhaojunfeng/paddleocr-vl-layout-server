@@ -1,0 +1,10 @@
+LICENSE
+README.md
+gen_token.py
+pyproject.toml
+server.py
+paddleocr_vl_layout_server.egg-info/PKG-INFO
+paddleocr_vl_layout_server.egg-info/SOURCES.txt
+paddleocr_vl_layout_server.egg-info/dependency_links.txt
+paddleocr_vl_layout_server.egg-info/requires.txt
+paddleocr_vl_layout_server.egg-info/top_level.txt

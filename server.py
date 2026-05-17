@@ -49,6 +49,7 @@ MAX_BATCH_WORKERS = int(os.environ.get("MAX_BATCH_WORKERS", "2"))
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", "3600"))
 SCANNED_PDF_CHAR_THRESHOLD = int(os.environ.get("SCANNED_PDF_CHAR_THRESHOLD", "50"))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
+JOBS_DIR = os.environ.get("JOBS_DIR", os.path.join(UPLOAD_DIR, "jobs"))
 ARCHIVE_RESULT_TTL_SECONDS = int(os.environ.get("ARCHIVE_RESULT_TTL_SECONDS", str(7 * 24 * 3600)))
 JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
 USER_DB_PATH = os.environ.get("USER_DB_PATH", "user.json")
@@ -703,18 +704,62 @@ def _write_manifest(manifest_path: str, job_id: str):
 # ─── Archive Job Store ───────────────────────────────────────────
 
 class ArchiveJobStore:
-    def __init__(self):
+    def __init__(self, jobs_dir: str):
         self._jobs: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._jobs_dir = jobs_dir
+
+    def _save_job(self, job_id: str):
+        """Persist a single job to disk (atomic write)."""
+        job = self._jobs.get(job_id)
+        if not job:
+            return
+        os.makedirs(self._jobs_dir, exist_ok=True)
+        path = os.path.join(self._jobs_dir, f"{job_id}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False)
+        os.replace(tmp, path)
+
+    def _load_all(self):
+        """Load all jobs from disk on startup."""
+        if not os.path.isdir(self._jobs_dir):
+            return
+        count = 0
+        for fname in os.listdir(self._jobs_dir):
+            if not fname.endswith(".json"):
+                continue
+            path = os.path.join(self._jobs_dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    job = json.load(f)
+                jid = job["job_id"]
+                self._jobs[jid] = job
+                count += 1
+            except Exception as e:
+                print(f"[archive] Failed to load job from {path}: {e}")
+        if count:
+            print(f"[archive] Loaded {count} job(s) from disk")
+
+    def _delete_job_file(self, job_id: str):
+        """Remove a job's JSON file from disk."""
+        path = os.path.join(self._jobs_dir, f"{job_id}.json")
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
 
     def create_job(self, archive_name: str, extract_dir: str,
-                   result_dir: str, total_files: int) -> str:
+                   result_dir: str, total_files: int,
+                   archive_path: str = "") -> str:
         job_id = str(uuid.uuid4())
         with self._lock:
             self._jobs[job_id] = {
                 "job_id": job_id,
                 "status": "pending",
                 "archive_name": archive_name,
+                "archive_path": archive_path,
                 "extract_dir": extract_dir,
                 "result_dir": result_dir,
                 "download_zip": None,
@@ -724,6 +769,7 @@ class ArchiveJobStore:
                 "manifest": [],
                 "created_at": time.time(),
             }
+            self._save_job(job_id)
         return job_id
 
     def get_job(self, job_id: str) -> dict | None:
@@ -735,11 +781,13 @@ class ArchiveJobStore:
         with self._lock:
             if job_id in self._jobs:
                 self._jobs[job_id]["status"] = status
+                self._save_job(job_id)
 
     def set_download_zip(self, job_id: str, zip_path: str):
         with self._lock:
             if job_id in self._jobs:
                 self._jobs[job_id]["download_zip"] = zip_path
+                self._save_job(job_id)
 
     def append_manifest_entry(self, job_id: str, entry: dict):
         with self._lock:
@@ -750,6 +798,13 @@ class ArchiveJobStore:
                     job["completed_files"] += 1
                 else:
                     job["failed_files"] += 1
+                self._save_job(job_id)
+
+    def get_incomplete_jobs(self) -> list[dict]:
+        """Return jobs that were interrupted mid-processing."""
+        with self._lock:
+            return [copy.deepcopy(j) for j in self._jobs.values()
+                    if j["status"] == "processing"]
 
     def cleanup_expired(self, max_age_seconds: float) -> list[str]:
         """Remove expired jobs, return download_zip paths for disk deletion."""
@@ -762,6 +817,7 @@ class ArchiveJobStore:
                 if zip_path:
                     expired_zips.append(zip_path)
                 del self._jobs[jid]
+                self._delete_job_file(jid)
         return expired_zips
 
 
@@ -769,7 +825,7 @@ class ArchiveJobStore:
 
 executor = ThreadPoolExecutor(max_workers=MAX_BATCH_WORKERS)
 batch_store = BatchJobStore()
-archive_store = ArchiveJobStore()
+archive_store = ArchiveJobStore(JOBS_DIR)
 
 
 def _fire_callback(url: str, job: dict):
@@ -904,6 +960,130 @@ def _process_archive_job(job_id: str, archive_path: str):
         archive_store.set_status(job_id, "failed")
 
 
+def _resume_archive_job(job_id: str):
+    """Resume an interrupted archive job from where it left off."""
+    job = archive_store.get_job(job_id)
+    if not job:
+        return
+
+    archive_path = job.get("archive_path", "")
+    extract_dir = job["extract_dir"]
+    result_dir = job["result_dir"]
+
+    # Edge case: compression was done but status not set to completed
+    existing_zip = job.get("download_zip")
+    if existing_zip and os.path.exists(existing_zip):
+        archive_store.set_status(job_id, "completed")
+        print(f"[archive] Job {job_id} was already finished, marked completed")
+        return
+    manifest_path = os.path.join(result_dir, "manifest.json")
+
+    # Collect already-processed files from persisted manifest
+    processed = {e["original_relative_path"] for e in job["manifest"]}
+    remaining = job["total_files"] - job["completed_files"] - job["failed_files"]
+
+    print(f"[archive] Resuming job {job_id}: {len(processed)} done, {remaining} remaining")
+
+    if remaining <= 0:
+        # All files were processed but job didn't finish (e.g. crashed during compression)
+        # Just re-compress and complete
+        pass
+    elif not archive_path or not os.path.exists(archive_path):
+        print(f"[archive] Cannot resume job {job_id}: archive file missing ({archive_path})")
+        archive_store.set_status(job_id, "failed")
+        return
+    else:
+        # Re-extract if extract_dir was cleaned up
+        if not os.path.isdir(extract_dir):
+            os.makedirs(extract_dir, exist_ok=True)
+            _safe_extract_archive(archive_path, extract_dir)
+
+        os.makedirs(result_dir, exist_ok=True)
+
+        # Process remaining files
+        for root, dirs, files in os.walk(extract_dir):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(file_path, extract_dir)
+
+                if rel_path in processed:
+                    continue
+
+                rel_no_ext, ext = os.path.splitext(rel_path)
+                md_rel_path = rel_no_ext + ".md"
+                json_rel_path = rel_no_ext + ".json"
+                md_abs_path = os.path.join(result_dir, md_rel_path)
+                json_abs_path = os.path.join(result_dir, json_rel_path)
+
+                entry = {
+                    "original_relative_path": rel_path,
+                    "md_relative_path": md_rel_path,
+                    "layout_relative_path": json_rel_path,
+                    "status": "success",
+                    "message": "",
+                }
+
+                try:
+                    os.makedirs(os.path.dirname(md_abs_path), exist_ok=True)
+                    req = LayoutParsingRequest(filePath=file_path)
+                    result = process_single_file(req)
+
+                    md_text = ""
+                    for page in result.get("result", {}).get("layoutParsingResults", []):
+                        page_md = page.get("markdown", {}).get("text", "")
+                        if page_md:
+                            md_text += page_md + "\n\n"
+
+                    with open(md_abs_path, "w", encoding="utf-8") as f:
+                        f.write(md_text)
+
+                    data_type = result.get("result", {}).get("dataInfo", {}).get("type", "")
+                    if data_type != "markitdown":
+                        with open(json_abs_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                result["result"]["layoutParsingResults"],
+                                f, ensure_ascii=False, indent=2,
+                            )
+                    else:
+                        entry["layout_relative_path"] = ""
+
+                except Exception as e:
+                    traceback.print_exc()
+                    entry["status"] = "failed"
+                    entry["message"] = str(e)
+                    entry["md_relative_path"] = ""
+                    entry["layout_relative_path"] = ""
+
+                archive_store.append_manifest_entry(job_id, entry)
+                _write_manifest(manifest_path, job_id)
+
+    # Compress and finalize (same as _process_archive_job)
+    try:
+        archive_name = job["archive_name"]
+        download_zip = os.path.join(
+            UPLOAD_DIR, f"{archive_name}_{int(time.time())}_result.zip"
+        )
+        _compress_directory(result_dir, download_zip)
+        archive_store.set_download_zip(job_id, download_zip)
+
+        # Cleanup intermediates
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        shutil.rmtree(result_dir, ignore_errors=True)
+        if archive_path and os.path.exists(archive_path):
+            try:
+                os.unlink(archive_path)
+            except OSError:
+                pass
+
+        archive_store.set_status(job_id, "completed")
+        print(f"[archive] Job {job_id} resumed and completed")
+
+    except Exception as e:
+        traceback.print_exc()
+        archive_store.set_status(job_id, "failed")
+        print(f"[archive] Job {job_id} resume failed: {e}")
+
+
 # ─── Cleanup ────────────────────────────────────────────────────────
 
 _cleanup_stop = threading.Event()
@@ -929,7 +1109,15 @@ def _cleanup_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(JOBS_DIR, exist_ok=True)
     _ensure_admin()
+
+    # Load persisted jobs and resume interrupted ones
+    archive_store._load_all()
+    for job in archive_store.get_incomplete_jobs():
+        print(f"[archive] Resuming interrupted job {job['job_id']}")
+        executor.submit(_resume_archive_job, job["job_id"])
+
     cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
     cleanup_thread.start()
     yield
@@ -1075,6 +1263,7 @@ async def archive_parsing(file: UploadFile = FastAPIFile(...)):
         extract_dir=extract_dir,
         result_dir=result_dir,
         total_files=total_files,
+        archive_path=archive_path,
     )
     executor.submit(_process_archive_job, job_id, archive_path)
 
@@ -1083,6 +1272,26 @@ async def archive_parsing(file: UploadFile = FastAPIFile(...)):
         "status": "pending",
         "totalFiles": total_files,
     }
+
+
+@app.get("/batch/archive-jobs")
+async def archive_list_jobs():
+    jobs = []
+    with archive_store._lock:
+        for j in archive_store._jobs.values():
+            total = j["total_files"]
+            done = j["completed_files"] + j["failed_files"]
+            jobs.append({
+                "jobId": j["job_id"],
+                "archiveName": j["archive_name"],
+                "status": j["status"],
+                "totalFiles": total,
+                "completedFiles": j["completed_files"],
+                "failedFiles": j["failed_files"],
+                "progress": round(done / total, 2) if total > 0 else 0.0,
+                "createdAt": j["created_at"],
+            })
+    return {"jobs": jobs}
 
 
 @app.get("/batch/archive-status/{job_id}")

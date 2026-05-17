@@ -24,3 +24,6 @@ dev = [
     "pytest>=7.0",
     "httpx>=0.24",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
