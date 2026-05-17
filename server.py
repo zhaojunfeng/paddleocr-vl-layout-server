@@ -901,7 +901,10 @@ def _process_archive_job(job_id: str, archive_path: str):
                 try:
                     os.makedirs(os.path.dirname(md_abs_path), exist_ok=True)
 
-                    req = LayoutParsingRequest(filePath=file_path)
+                    req = LayoutParsingRequest(
+                        filePath=file_path,
+                        markdownIgnoreLabels=job.get("markdown_ignore_labels"),
+                    )
                     result = process_single_file(req)
 
                     # Extract markdown text from result
@@ -1226,8 +1229,20 @@ async def batch_result(job_id: str):
 # ─── Archive Endpoints ───────────────────────────────────────────
 
 @app.post("/batch/archive-parsing", status_code=202)
-async def archive_parsing(file: UploadFile = FastAPIFile(...)):
+async def archive_parsing(
+    file: UploadFile = FastAPIFile(...),
+    markdownIgnoreLabels: Optional[str] = None,  # JSON array string, e.g. '["header","footer"]'
+):
     filename = file.filename or "archive.zip"
+
+    # Parse markdownIgnoreLabels from JSON string to list
+    ignore_labels: Optional[list[str]] = None
+    if markdownIgnoreLabels:
+        try:
+            import json as _json
+            ignore_labels = _json.loads(markdownIgnoreLabels)
+        except Exception:
+            pass
     lower_name = filename.lower()
     supported = (".zip", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tar")
     if not any(lower_name.endswith(ext) for ext in supported):
@@ -1265,6 +1280,10 @@ async def archive_parsing(file: UploadFile = FastAPIFile(...)):
         total_files=total_files,
         archive_path=archive_path,
     )
+    # Store ignore_labels in job metadata for processing
+    if ignore_labels:
+        archive_store._jobs[job_id]["markdown_ignore_labels"] = ignore_labels
+        archive_store._save_job(job_id)
     executor.submit(_process_archive_job, job_id, archive_path)
 
     return {
