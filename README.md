@@ -247,9 +247,10 @@ CMD ["python", "server.py"]
 
 ```bash
 cp .env.example .env
-# 编辑 .env：二选一填写
+# 编辑 .env：二选一
 #   - AI Studio 托管模式：AI_STUDIO_TOKEN=xxx（无需 vLLM）
-#   - 本地 vLLM 模式：VLLM_SERVER_URL=http://your-vllm:8000/v1
+#   - 本地 vLLM 模式：保持留空；VLLM_SERVER_URL 等其余配置在
+#     docker-compose.yaml 中修改（宿主机端口、JWT_SECRET 等）
 ```
 
 ### 2. 启动
@@ -284,7 +285,8 @@ curl http://localhost:8399/layout-parsing \
 
 - **健康检查**：容器内采用 TCP 探测（`/health` 也在鉴权之下，无法无 token 探测）。
 - **持久化**：`layout-data` 卷（uploads / 任务 / user.json）与 `paddlex-models` 卷（Paddle 模型缓存，首次本地模式运行下载 ~125MB）。
-- **重启 token 失效**：若修改了 `JWT_SECRET`，旧 token 全部失效；建议 `.env` 固定一个随机值。
+- **配置覆盖**：为兼容旧版 `docker-compose`（v1 不支持 `${VAR:-default}` 插值），端口与常规配置直接写在 compose 文件中，需要覆盖时修改对应行；`.env` 仅透传 `AI_STUDIO_TOKEN`。
+- **重启 token 失效**：若修改了 `JWT_SECRET`，旧 token 全部失效；建议改成随机长字符串后保持稳定。
 - **内置 vLLM**：需要 NVIDIA GPU + `nvidia-container-toolkit`，模型名/参数可按实际环境修改 compose 中 `vllm` 服务。
 
 ## Verified Compatibility

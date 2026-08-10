@@ -1,7 +1,7 @@
 # ── PaddleOCR-VL Layout Parsing Server ──────────────────────────────
 # 用法：
 #   1) 仅启动本服务（默认，AI Studio 托管模式或连外部 vLLM）：
-#        cp .env.example .env   # 按需填写 AI_STUDIO_TOKEN 或 VLLM_SERVER_URL
+#        cp .env.example .env   # 按需填写 AI_STUDIO_TOKEN
 #        docker compose up -d --build
 #   2) 连同 vLLM（GPU）一起启动：
 #        docker compose --profile vllm up -d --build
@@ -10,6 +10,11 @@
 #       docker compose logs layout-server | grep "Admin token"
 #
 # 健康检查使用 TCP 探测（/health 也在鉴权之下，无法无 token HTTP 探测）。
+#
+# 兼容性说明：为避免旧版 compose（docker-compose v1）不支持
+# "${VAR:-default}" 插值语法导致报错，这里不写带默认值的插值；
+# 常规配置直接写明文，需要覆盖时改对应行即可。
+# .env 中仅支持 AI_STUDIO_TOKEN（空值 = 走本地 vLLM 模式）。
 
 services:
   layout-server:
@@ -17,23 +22,27 @@ services:
     image: paddleocr-vl-layout-server:latest
     container_name: paddleocr-vl-layout-server
     ports:
-      - "${HOST_PORT:-8399}:8399"
+      # 宿主机端口：8399（需要改端口时修改左边数字即可）
+      - "8399:8399"
     environment:
       PORT: "8399"
       # —— 二选一：本地 vLLM 模式 ——
-      # 指向内置 vllm 服务（--profile vllm）或外部 vLLM 地址
-      VLLM_SERVER_URL: "${VLLM_SERVER_URL:-http://vllm:8000/v1}"
+      # 默认指向 compose 内置 vllm 服务（--profile vllm）；
+      # 连外部 vLLM 时改成 http://your-vllm-host:8000/v1
+      VLLM_SERVER_URL: http://vllm:8000/v1
       # —— 二选一：AI Studio 托管模式（配置后优先，无需 vLLM）——
-      AI_STUDIO_TOKEN: "${AI_STUDIO_TOKEN:-}"
-      AI_STUDIO_MODEL: "${AI_STUDIO_MODEL:-PaddleOCR-VL-1.6}"
-      AI_STUDIO_TIMEOUT: "${AI_STUDIO_TIMEOUT:-1800}"
+      # 在 .env 中设置 AI_STUDIO_TOKEN；留空则走本地模式
+      AI_STUDIO_TOKEN: ${AI_STUDIO_TOKEN}
+      AI_STUDIO_MODEL: PaddleOCR-VL-1.6
+      AI_STUDIO_TIMEOUT: "1800"
       # —— 通用配置 ——
       UPLOAD_DIR: /app/data/uploads
       JOBS_DIR: /app/data/uploads/jobs
       USER_DB_PATH: /app/data/user.json
-      JWT_SECRET: "${JWT_SECRET:-change-me-in-production}"
-      MAX_BATCH_WORKERS: "${MAX_BATCH_WORKERS:-2}"
-      ARCHIVE_RESULT_TTL_SECONDS: "${ARCHIVE_RESULT_TTL_SECONDS:-604800}"
+      # 生产环境请改成随机长字符串，且保持稳定（改动会使旧 token 失效）
+      JWT_SECRET: change-me-in-production
+      MAX_BATCH_WORKERS: "2"
+      ARCHIVE_RESULT_TTL_SECONDS: "604800"
     volumes:
       # 持久化：上传/任务/用户库、Paddle 模型缓存（首次本地模式运行会下载 ~125MB）
       - layout-data:/app/data
