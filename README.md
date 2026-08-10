@@ -247,10 +247,11 @@ CMD ["python", "server.py"]
 
 ```bash
 cp .env.example .env
-# 编辑 .env：二选一
-#   - AI Studio 托管模式：AI_STUDIO_TOKEN=xxx（无需 vLLM）
-#   - 本地 vLLM 模式：保持留空；VLLM_SERVER_URL 等其余配置在
-#     docker-compose.yaml 中修改（宿主机端口、JWT_SECRET 等）
+# 编辑 .env：
+#   - AI Studio 托管模式：设置 AI_STUDIO_TOKEN=xxx（无需 vLLM）
+#   - 本地 vLLM 模式：留空 AI_STUDIO_TOKEN，可选覆盖 VLLM_SERVER_URL
+#   - UPLOAD_DIR / JOBS_DIR / USER_DB_PATH 等容器内路径一般无需修改
+#     （若改 UPLOAD_DIR，必须同步改 JOBS_DIR 与 volumes 挂载点）
 ```
 
 ### 2. 启动
@@ -284,7 +285,8 @@ curl http://localhost:8399/layout-parsing \
 
 - **健康检查**：容器内采用 TCP 探测（`/health` 也在鉴权之下，无法无 token 探测）。
 - **持久化**：`layout-data` 卷（uploads / 任务 / user.json）与 `paddlex-models` 卷（Paddle 模型缓存，首次本地模式运行下载 ~125MB）。
-- **配置覆盖**：为兼容旧版 `docker-compose`（v1 不支持 `${VAR:-default}` 插值和 `profiles`），文件声明 `version: "3.8"`，端口与常规配置直接写在 compose 文件中（需要覆盖时修改对应行）；`.env` 仅透传 `AI_STUDIO_TOKEN`。内置 vLLM 以注释形式保留，取消注释即可启用（需 NVIDIA GPU + `nvidia-container-toolkit`）。
+- **配置覆盖**：文件声明 `version: "3.8"`（兼容 docker-compose v1.27+ 与 v2），使用 `${VAR:-default}` 插值，全部常规配置（`VLLM_SERVER_URL`、`AI_STUDIO_MODEL`、`UPLOAD_DIR`、`JOBS_DIR`、`USER_DB_PATH`、`JWT_SECRET` 等）均可在 `.env` 中覆盖；`.env` 中 `AI_STUDIO_TOKEN` 留空即走本地 vLLM 模式。内置 vLLM 以注释形式保留，取消注释即可启用（需 NVIDIA GPU + `nvidia-container-toolkit`）。
+- **路径联动**：`UPLOAD_DIR` / `JOBS_DIR` / `USER_DB_PATH` 是容器内路径，必须与 `volumes` 挂载点对应；修改 `UPLOAD_DIR` 时请同步修改 `JOBS_DIR` 与挂载点。
 - **重启 token 失效**：若修改了 `JWT_SECRET`，旧 token 全部失效；建议改成随机长字符串后保持稳定。
 - **升级建议**：你的报错来自旧版 `docker-compose`（v1）。建议优先升级到 v2（`docker compose` 子命令，随 Docker Desktop / docker-ce 内置），新版对 `${VAR:-default}` 插值、`profiles` 等支持更完整。
 
