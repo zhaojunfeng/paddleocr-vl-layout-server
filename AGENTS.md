@@ -25,13 +25,30 @@ This is a FastAPI server that exposes a `/layout-parsing` endpoint, making a vLL
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-# 2. Set vLLM server URL
+# 2a. Option A — local pipeline (requires a vLLM server)
 export VLLM_SERVER_URL="http://your-vllm-server:8000/v1"
+
+# 2b. Option B — AI Studio hosted API (no vLLM server needed)
+# When AI_STUDIO_TOKEN is set, scanned PDFs and images are parsed via
+# the paddleocr.aistudio hosted API instead of the local pipeline.
+export AI_STUDIO_TOKEN="your-aistudio-access-token"
 
 # 3. Start server
 python server.py
 # Server runs on port 8399 by default (set PORT env var to change)
 ```
+
+## AI Studio Hosted API Mode
+
+When `AI_STUDIO_TOKEN` is configured, the OCR route (scanned PDFs + images) in
+`process_single_file()` is dispatched to `process_with_aistudio()` instead of
+the local PaddleOCRVL pipeline — see the `AI_STUDIO_*` env vars at the top of
+`server.py`. Text PDFs and Office files still go through local markitdown.
+Relevant functions: `_build_aistudio_optional_payload`, `_merge_aistudio_results`,
+`_resolve_image_value`, `process_with_aistudio`. Each JSONL line from the hosted
+API carries one page's `result`, which is merged into the standard
+`{layoutParsingResults, preprocessedImages, dataInfo}` response shape, with
+remote image URLs downloaded and embedded as base64 data URLs.
 
 ## API Contract
 

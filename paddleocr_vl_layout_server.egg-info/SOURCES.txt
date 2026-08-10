@@ -8,3 +8,7 @@ paddleocr_vl_layout_server.egg-info/SOURCES.txt
 paddleocr_vl_layout_server.egg-info/dependency_links.txt
 paddleocr_vl_layout_server.egg-info/requires.txt
 paddleocr_vl_layout_server.egg-info/top_level.txt
+tests/test_aistudio.py
+tests/test_api.py
+tests/test_archive_store.py
+tests/test_resume.py

@@ -14,6 +14,7 @@ Requires-Dist: paddlepaddle>=3.0
 Requires-Dist: PyMuPDF>=1.24
 Requires-Dist: markitdown[all]>=0.1
 Requires-Dist: PyJWT>=2.8
+Requires-Dist: requests>=2.25
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0; extra == "dev"
 Requires-Dist: httpx>=0.24; extra == "dev"

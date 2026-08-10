@@ -57,6 +57,33 @@ python server.py
 PORT=9000 python server.py
 ```
 
+### AI Studio Hosted API Mode (no local vLLM needed)
+
+If you have an [AI Studio access token](https://aistudio.baidu.com/), you can skip the local vLLM deployment entirely — scanned PDFs and images are sent to the `paddleocr.aistudio` hosted API instead of the local PaddleOCRVL + vLLM pipeline:
+
+```bash
+# Configure the token (the hosted API is then used automatically)
+export AI_STUDIO_TOKEN="your-aistudio-access-token"
+export AI_STUDIO_MODEL="PaddleOCR-VL-1.6"   # optional, default: PaddleOCR-VL-1.6
+python server.py
+```
+
+When `AI_STUDIO_TOKEN` is set:
+
+- Scanned PDFs and images (`/layout-parsing`, batch, and archive jobs) are parsed via the hosted API.
+- Text PDFs and Office files still go through local markitdown.
+- The local vLLM server is **not** contacted; `VLLM_SERVER_URL` can be left unset.
+- Results are returned in the exact same format as the local pipeline (remote image URLs are downloaded and embedded as base64 data URLs).
+
+| Env var | Default | Description |
+|---|---|---|
+| `AI_STUDIO_TOKEN` | *(unset)* | Access token; when set, enables the hosted API mode |
+| `AI_STUDIO_MODEL` | `PaddleOCR-VL-1.6` | Model name used for hosted jobs |
+| `AI_STUDIO_JOB_URL` | `https://paddleocr.aistudio-app.com/api/v2/ocr/jobs` | Job API base URL |
+| `AI_STUDIO_POLL_INTERVAL` | `5` | Poll interval in seconds |
+| `AI_STUDIO_TIMEOUT` | `1800` | Max wait for a job (seconds) |
+| `AI_STUDIO_REQUEST_TIMEOUT` | `120` | Per-HTTP-request timeout (seconds) |
+
 ### Test
 
 ```bash
@@ -211,6 +238,54 @@ ENV VLLM_SERVER_URL=http://vllm:8000/v1
 EXPOSE 8399
 CMD ["python", "server.py"]
 ```
+
+## Docker Deployment
+
+项目自带 `Dockerfile`、`docker-compose.yaml` 与 `.env.example`，支持两种运行模式。
+
+### 1. 准备环境变量
+
+```bash
+cp .env.example .env
+# 编辑 .env：二选一填写
+#   - AI Studio 托管模式：AI_STUDIO_TOKEN=xxx（无需 vLLM）
+#   - 本地 vLLM 模式：VLLM_SERVER_URL=http://your-vllm:8000/v1
+```
+
+### 2. 启动
+
+```bash
+# 仅启动本服务（默认；连接外部 vLLM 或 AI Studio 托管）
+docker compose up -d --build
+
+# 连同内置 vLLM（GPU）一起启动
+docker compose --profile vllm up -d --build
+```
+
+### 3. 获取访问令牌
+
+**所有接口都在 JWT 鉴权之下（包括 `/health`）**，管理员 token 每次启动打印到日志：
+
+```bash
+docker compose logs layout-server | grep "Admin token"
+# [auth] Admin token: eyJhbGciOi...
+```
+
+调用示例：
+
+```bash
+curl http://localhost:8399/layout-parsing \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"file": "<base64>", "fileType": 0}'
+```
+
+### 说明
+
+- **健康检查**：容器内采用 TCP 探测（`/health` 也在鉴权之下，无法无 token 探测）。
+- **持久化**：`layout-data` 卷（uploads / 任务 / user.json）与 `paddlex-models` 卷（Paddle 模型缓存，首次本地模式运行下载 ~125MB）。
+- **重启 token 失效**：若修改了 `JWT_SECRET`，旧 token 全部失效；建议 `.env` 固定一个随机值。
+- **内置 vLLM**：需要 NVIDIA GPU + `nvidia-container-toolkit`，模型名/参数可按实际环境修改 compose 中 `vllm` 服务。
 
 ## Verified Compatibility
 

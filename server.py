@@ -38,12 +38,24 @@ from typing import Optional
 import cv2
 import jwt
 import numpy as np
+import requests
 from fastapi import Depends, FastAPI, Header, Request, UploadFile, File as FastAPIFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 # ─── Configuration ───────────────────────────────────────────────────
 VLLM_SERVER_URL = os.environ.get("VLLM_SERVER_URL", "http://134.199.132.159/v1")
+# AI Studio hosted API mode: when AI_STUDIO_TOKEN is set, scanned PDFs and
+# images are parsed via paddleocr.aistudio API instead of the local
+# PaddleOCRVL + vLLM pipeline.
+AI_STUDIO_TOKEN = os.environ.get("AI_STUDIO_TOKEN", "").strip()
+AI_STUDIO_MODEL = os.environ.get("AI_STUDIO_MODEL", "PaddleOCR-VL-1.6")
+AI_STUDIO_JOB_URL = os.environ.get(
+    "AI_STUDIO_JOB_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+)
+AI_STUDIO_POLL_INTERVAL = float(os.environ.get("AI_STUDIO_POLL_INTERVAL", "5"))
+AI_STUDIO_TIMEOUT = float(os.environ.get("AI_STUDIO_TIMEOUT", "1800"))
+AI_STUDIO_REQUEST_TIMEOUT = float(os.environ.get("AI_STUDIO_REQUEST_TIMEOUT", "120"))
 SERVER_PORT = int(os.environ.get("PORT", "8399"))
 MAX_BATCH_WORKERS = int(os.environ.get("MAX_BATCH_WORKERS", "2"))
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", "3600"))
@@ -452,7 +464,235 @@ def get_file_processing_route(file_path: str) -> str:
     return "markitdown"
 
 
+# ─── AI Studio Hosted API ─────────────────────────────────────────
+# When AI_STUDIO_TOKEN is configured, scanned PDFs and images are sent
+# to the paddleocr.aistudio hosted API. The returned JSONL lines have the
+# same result structure as the local /layout-parsing response, so the
+# merged output is a drop-in replacement for the local pipeline.
+
+# AI Studio optionalPayload keys (camelCase, same as the request model).
+AI_STUDIO_OPTION_KEYS = (
+    "useDocOrientationClassify",
+    "useDocUnwarping",
+    "useLayoutDetection",
+    "useChartRecognition",
+    "useSealRecognition",
+    "useOcrForImageBlock",
+    "promptLabel",
+    "temperature",
+    "topP",
+    "repetitionPenalty",
+    "markdownIgnoreLabels",
+)
+
+
+def _build_aistudio_optional_payload(req: LayoutParsingRequest) -> dict:
+    """Build the optionalPayload from request fields (only non-None values)."""
+    payload = {}
+    for key in AI_STUDIO_OPTION_KEYS:
+        val = getattr(req, key, None)
+        if val is not None:
+            payload[key] = val
+    return payload
+
+
+def _resolve_image_value(value: str, timeout: float = 30) -> str:
+    """Convert an http(s) image URL into a base64 data URL.
+
+    Keeps already-embedded data: URLs untouched so the AI Studio result
+    matches the local server contract (base64 data URLs everywhere).
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith("data:"):
+        return value
+    if value.startswith(("http://", "https://")):
+        resp = requests.get(value, timeout=timeout)
+        resp.raise_for_status()
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if ctype.startswith("image/"):
+            b64 = base64.b64encode(resp.content).decode("ascii")
+            return f"data:{ctype};base64,{b64}"
+        return image_to_base64_url(resp.content)
+    return value
+
+
+def _normalize_page_images(page: dict):
+    """Download remote image URLs in a layoutParsingResults entry."""
+    md = page.get("markdown")
+    if isinstance(md, dict) and isinstance(md.get("images"), dict):
+        md["images"] = {k: _resolve_image_value(v) for k, v in md["images"].items()}
+    out_imgs = page.get("outputImages")
+    if isinstance(out_imgs, dict):
+        for k, v in out_imgs.items():
+            out_imgs[k] = _resolve_image_value(v)
+    if page.get("inputImage"):
+        page["inputImage"] = _resolve_image_value(page["inputImage"])
+
+
+def _merge_aistudio_results(lines: list[dict], is_pdf: bool) -> dict:
+    """Merge JSONL page results into the local /layout-parsing result shape.
+
+    Each JSONL line is one page: {"result": {layoutParsingResults, ...}}.
+    """
+    all_layout = []
+    data_infos = []
+    for entry in lines:
+        result = entry.get("result") or {}
+        all_layout.extend(result.get("layoutParsingResults") or [])
+        if result.get("dataInfo"):
+            data_infos.append(result["dataInfo"])
+
+    # Normalize every page so images are embedded base64 data URLs
+    for page in all_layout:
+        _normalize_page_images(page)
+
+    preprocessed = [
+        _resolve_image_value(u)
+        for di in data_infos
+        for u in di.get("preprocessedImages", [])
+    ]
+    if not preprocessed:
+        preprocessed = [page.get("inputImage") or "" for page in all_layout]
+
+    # Build dataInfo in the same shape as the local pipeline
+    first_di = dict(data_infos[0]) if data_infos else {}
+    data_info = {"type": first_di.get("type") or ("pdf" if is_pdf else "image")}
+    if is_pdf or len(all_layout) > 1:
+        data_info["numPages"] = len(all_layout)
+        data_info["pages"] = []
+        for i, page in enumerate(all_layout):
+            w = h = 0
+            if i < len(data_infos):
+                w = data_infos[i].get("width", 0)
+                h = data_infos[i].get("height", 0)
+            if not w and not h:
+                pr = page.get("prunedResult") or {}
+                w = pr.get("width", 0)
+                h = pr.get("height", 0)
+            data_info["pages"].append({"width": w, "height": h})
+    else:
+        pr = (all_layout[0].get("prunedResult") or {}) if all_layout else {}
+        data_info["width"] = first_di.get("width", pr.get("width", 0))
+        data_info["height"] = first_di.get("height", pr.get("height", 0))
+
+    return {
+        "layoutParsingResults": all_layout,
+        "preprocessedImages": preprocessed,
+        "dataInfo": data_info,
+    }
+
+
+def process_with_aistudio(file_path: str, is_pdf: bool, req: LayoutParsingRequest,
+                          log_id: str | None = None) -> dict:
+    """Parse a scanned PDF or image via the paddleocr.aistudio hosted API.
+
+    Submits a job, polls until completion, downloads the JSONL result and
+    merges it into the same response shape as the local pipeline.
+    """
+    start_time = time.time()
+    if log_id is None:
+        log_id = str(uuid.uuid4())
+    if not AI_STUDIO_TOKEN:
+        raise RuntimeError("AI_STUDIO_TOKEN is not configured")
+
+    headers = {"Authorization": f"bearer {AI_STUDIO_TOKEN}"}
+    optional_payload = _build_aistudio_optional_payload(req)
+    data = {
+        "model": AI_STUDIO_MODEL,
+        "optionalPayload": json.dumps(optional_payload),
+    }
+
+    # 1. Submit job (local file mode)
+    with open(file_path, "rb") as f:
+        files = {"file": f}
+        job_response = requests.post(
+            AI_STUDIO_JOB_URL, headers=headers, data=data, files=files,
+            timeout=AI_STUDIO_REQUEST_TIMEOUT,
+        )
+    if job_response.status_code != 200:
+        raise RuntimeError(
+            f"AI Studio job submission failed ({job_response.status_code}): "
+            f"{job_response.text}"
+        )
+    job_id = job_response.json()["data"]["jobId"]
+    print(f"[{log_id}] AI Studio job submitted: {job_id}")
+
+    # 2. Poll until done / failed / timeout
+    jsonl_url = ""
+    deadline = time.time() + AI_STUDIO_TIMEOUT
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError(
+                f"AI Studio job {job_id} timed out after {AI_STUDIO_TIMEOUT}s"
+            )
+        result_response = requests.get(
+            f"{AI_STUDIO_JOB_URL}/{job_id}", headers=headers,
+            timeout=AI_STUDIO_REQUEST_TIMEOUT,
+        )
+        if result_response.status_code != 200:
+            raise RuntimeError(
+                f"AI Studio status check failed ({result_response.status_code}): "
+                f"{result_response.text}"
+            )
+        state = result_response.json()["data"]["state"]
+        if state in ("pending", "running"):
+            try:
+                prog = result_response.json()["data"]["extractProgress"]
+                print(f"[{log_id}] AI Studio job {job_id}: {state}, "
+                      f"{prog.get('extractedPages', '?')}/{prog.get('totalPages', '?')} pages")
+            except (KeyError, TypeError):
+                print(f"[{log_id}] AI Studio job {job_id}: {state}")
+        elif state == "done":
+            jsonl_url = result_response.json()["data"]["resultUrl"]["jsonUrl"]
+            break
+        elif state == "failed":
+            error_msg = result_response.json()["data"].get("errorMsg", "unknown error")
+            raise RuntimeError(f"AI Studio job {job_id} failed: {error_msg}")
+        else:
+            raise RuntimeError(f"AI Studio job {job_id} unknown state: {state}")
+        time.sleep(AI_STUDIO_POLL_INTERVAL)
+
+    # 3. Download JSONL result
+    jsonl_response = requests.get(jsonl_url, timeout=AI_STUDIO_REQUEST_TIMEOUT)
+    jsonl_response.raise_for_status()
+    lines = []
+    for raw in jsonl_response.text.strip().split("\n"):
+        raw = raw.strip()
+        if raw:
+            lines.append(json.loads(raw))
+
+    merged = _merge_aistudio_results(lines, is_pdf)
+    elapsed = time.time() - start_time
+    print(f"[{log_id}] AI Studio done in {elapsed:.1f}s, "
+          f"{len(merged['layoutParsingResults'])} pages")
+
+    return {
+        "logId": log_id,
+        "errorCode": 0,
+        "errorMsg": "Success",
+        "result": merged,
+    }
+
+
 # ─── Core Processing ────────────────────────────────────────────────
+
+def _sniff_file_suffix(data: bytes) -> str:
+    """Detect the real file extension from magic bytes (best effort)."""
+    if data.startswith(b"%PDF"):
+        return ".pdf"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG"):
+        return ".png"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tiff"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
 
 def process_single_file(req: LayoutParsingRequest, log_id: str | None = None) -> dict:
     """Process a single file. Supports base64 (file+fileType) or server path (filePath)."""
@@ -476,7 +716,7 @@ def process_single_file(req: LayoutParsingRequest, log_id: str | None = None) ->
         file_bytes = base64.b64decode(req.file)
         file_type = req.fileType if req.fileType is not None else 1
         is_pdf = file_type == 0
-        suffix = ".pdf" if is_pdf else ".png"
+        suffix = ".pdf" if is_pdf else _sniff_file_suffix(file_bytes)
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(file_bytes)
             file_path = tmp.name
@@ -494,9 +734,14 @@ def process_single_file(req: LayoutParsingRequest, log_id: str | None = None) ->
             if not use_path_directly:
                 os.unlink(file_path)
 
-    # OCR path: process through PaddleOCRVL
+    # OCR path: process through PaddleOCRVL (or AI Studio hosted API)
     tmp_path = file_path  # for cleanup in finally
     try:
+        # AI Studio mode: use the hosted API instead of the local
+        # PaddleOCRVL + vLLM pipeline (no VLLM_SERVER_URL needed).
+        if AI_STUDIO_TOKEN:
+            return process_with_aistudio(tmp_path, is_pdf, req, log_id)
+
         pipeline = get_pipeline()
         kwargs = build_predict_kwargs(req)
 
@@ -1114,6 +1359,13 @@ async def lifespan(app: FastAPI):
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(JOBS_DIR, exist_ok=True)
     _ensure_admin()
+
+    if AI_STUDIO_TOKEN:
+        print(f"[aistudio] AI Studio mode enabled (model={AI_STUDIO_MODEL}), "
+              f"scanned PDFs/images will use the hosted API")
+    else:
+        print(f"[aistudio] AI Studio mode disabled, using local pipeline "
+              f"(VLLM_SERVER_URL={VLLM_SERVER_URL})")
 
     # Load persisted jobs and resume interrupted ones
     archive_store._load_all()
