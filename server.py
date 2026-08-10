@@ -58,6 +58,8 @@ AI_STUDIO_TIMEOUT = float(os.environ.get("AI_STUDIO_TIMEOUT", "1800"))
 AI_STUDIO_REQUEST_TIMEOUT = float(os.environ.get("AI_STUDIO_REQUEST_TIMEOUT", "120"))
 SERVER_PORT = int(os.environ.get("PORT", "8399"))
 MAX_BATCH_WORKERS = int(os.environ.get("MAX_BATCH_WORKERS", "2"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "20"))
+MAX_CONCURRENT_BATCHES = int(os.environ.get("MAX_CONCURRENT_BATCHES", "2"))
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_SECONDS", "3600"))
 SCANNED_PDF_CHAR_THRESHOLD = int(os.environ.get("SCANNED_PDF_CHAR_THRESHOLD", "50"))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./uploads")
@@ -1092,19 +1094,101 @@ def _fire_callback(url: str, job: dict):
         print(f"[batch] Callback failed for job {job['job_id']}: {e}")
 
 
+def _process_file_in_batch(job_id: str, idx: int, file_req: BatchFileRequest):
+    """Process a single file within a batch job."""
+    try:
+        result = process_single_file(file_req)
+        batch_store.set_file_result(job_id, idx, result)
+    except Exception as e:
+        traceback.print_exc()
+        batch_store.set_file_error(job_id, idx, str(e))
+
+
 def _process_batch_job(job_id: str, files: list[BatchFileRequest]):
     batch_store.set_status(job_id, "processing")
-    for idx, file_req in enumerate(files):
-        try:
-            result = process_single_file(file_req)
-            batch_store.set_file_result(job_id, idx, result)
-        except Exception as e:
-            traceback.print_exc()
-            batch_store.set_file_error(job_id, idx, str(e))
+
+    # Split files into chunks of BATCH_SIZE
+    chunks = []
+    for i in range(0, len(files), BATCH_SIZE):
+        chunks.append(list(enumerate(files[i:i + BATCH_SIZE], start=i)))
+
+    print(f"[batch] Job {job_id}: {len(files)} files, {len(chunks)} batches of up to {BATCH_SIZE}, {MAX_CONCURRENT_BATCHES} concurrent")
+
+    batch_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_BATCHES)
+    futures = []
+    for chunk in chunks:
+        def _run_batch(batch_items=chunk):
+            for idx, file_req in batch_items:
+                _process_file_in_batch(job_id, idx, file_req)
+        futures.append(batch_executor.submit(_run_batch))
+
+    # Wait for all batches to complete
+    for f in futures:
+        f.result()
+    batch_executor.shutdown(wait=False)
 
     job = batch_store.get_job(job_id)
     if job and job.get("callback_url"):
         _fire_callback(job["callback_url"], job)
+
+
+def _process_archive_file(job_id: str, file_path: str, result_dir: str, extract_dir: str, manifest_path: str):
+    """Process a single file within an archive job. Returns entry dict."""
+    rel_path = os.path.relpath(file_path, extract_dir)
+    rel_no_ext, ext = os.path.splitext(rel_path)
+
+    md_rel_path = rel_no_ext + ".md"
+    json_rel_path = rel_no_ext + ".json"
+    md_abs_path = os.path.join(result_dir, md_rel_path)
+    json_abs_path = os.path.join(result_dir, json_rel_path)
+
+    entry = {
+        "original_relative_path": rel_path,
+        "md_relative_path": md_rel_path,
+        "layout_relative_path": json_rel_path,
+        "status": "success",
+        "message": "",
+    }
+
+    try:
+        os.makedirs(os.path.dirname(md_abs_path), exist_ok=True)
+
+        req = LayoutParsingRequest(
+            filePath=file_path,
+            markdownIgnoreLabels=archive_store.get_job(job_id).get("markdown_ignore_labels") if archive_store.get_job(job_id) else None,
+        )
+        result = process_single_file(req)
+
+        # Extract markdown text from result
+        md_text = ""
+        for page in result.get("result", {}).get("layoutParsingResults", []):
+            page_md = page.get("markdown", {}).get("text", "")
+            if page_md:
+                md_text += page_md + "\n\n"
+
+        # Save markdown
+        with open(md_abs_path, "w", encoding="utf-8") as f:
+            f.write(md_text)
+
+        # Save layout JSON only for OCR results
+        data_type = result.get("result", {}).get("dataInfo", {}).get("type", "")
+        if data_type != "markitdown":
+            with open(json_abs_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    result["result"]["layoutParsingResults"],
+                    f, ensure_ascii=False, indent=2,
+                )
+        else:
+            entry["layout_relative_path"] = ""
+
+    except Exception as e:
+        traceback.print_exc()
+        entry["status"] = "failed"
+        entry["message"] = str(e)
+        entry["md_relative_path"] = ""
+        entry["layout_relative_path"] = ""
+
+    return entry
 
 
 def _process_archive_job(job_id: str, archive_path: str):
@@ -1123,67 +1207,30 @@ def _process_archive_job(job_id: str, archive_path: str):
         # Extract archive
         _safe_extract_archive(archive_path, extract_dir)
 
-        # Walk extracted files and process each
+        # Collect all files
+        all_files = []
         for root, dirs, files in os.walk(extract_dir):
             for filename in files:
-                file_path = os.path.join(root, filename)
-                rel_path = os.path.relpath(file_path, extract_dir)
-                rel_no_ext, ext = os.path.splitext(rel_path)
+                all_files.append(os.path.join(root, filename))
 
-                md_rel_path = rel_no_ext + ".md"
-                json_rel_path = rel_no_ext + ".json"
-                md_abs_path = os.path.join(result_dir, md_rel_path)
-                json_abs_path = os.path.join(result_dir, json_rel_path)
+        # Split into batches of BATCH_SIZE
+        chunks = [all_files[i:i + BATCH_SIZE] for i in range(0, len(all_files), BATCH_SIZE)]
+        print(f"[archive] Job {job_id}: {len(all_files)} files, {len(chunks)} batches of up to {BATCH_SIZE}, {MAX_CONCURRENT_BATCHES} concurrent")
 
-                entry = {
-                    "original_relative_path": rel_path,
-                    "md_relative_path": md_rel_path,
-                    "layout_relative_path": json_rel_path,
-                    "status": "success",
-                    "message": "",
-                }
+        manifest_lock = threading.Lock()
 
-                try:
-                    os.makedirs(os.path.dirname(md_abs_path), exist_ok=True)
+        def _run_batch(batch_files):
+            for file_path in batch_files:
+                entry = _process_archive_file(job_id, file_path, result_dir, extract_dir, manifest_path)
+                with manifest_lock:
+                    archive_store.append_manifest_entry(job_id, entry)
+                    _write_manifest(manifest_path, job_id)
 
-                    req = LayoutParsingRequest(
-                        filePath=file_path,
-                        markdownIgnoreLabels=job.get("markdown_ignore_labels"),
-                    )
-                    result = process_single_file(req)
-
-                    # Extract markdown text from result
-                    md_text = ""
-                    for page in result.get("result", {}).get("layoutParsingResults", []):
-                        page_md = page.get("markdown", {}).get("text", "")
-                        if page_md:
-                            md_text += page_md + "\n\n"
-
-                    # Save markdown
-                    with open(md_abs_path, "w", encoding="utf-8") as f:
-                        f.write(md_text)
-
-                    # Save layout JSON only for OCR results
-                    data_type = result.get("result", {}).get("dataInfo", {}).get("type", "")
-                    if data_type != "markitdown":
-                        with open(json_abs_path, "w", encoding="utf-8") as f:
-                            json.dump(
-                                result["result"]["layoutParsingResults"],
-                                f, ensure_ascii=False, indent=2,
-                            )
-                    else:
-                        entry["layout_relative_path"] = ""
-
-                except Exception as e:
-                    traceback.print_exc()
-                    entry["status"] = "failed"
-                    entry["message"] = str(e)
-                    entry["md_relative_path"] = ""
-                    entry["layout_relative_path"] = ""
-
-                # Update manifest after each file
-                archive_store.append_manifest_entry(job_id, entry)
-                _write_manifest(manifest_path, job_id)
+        batch_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_BATCHES)
+        futures = [batch_executor.submit(_run_batch, chunk) for chunk in chunks]
+        for f in futures:
+            f.result()
+        batch_executor.shutdown(wait=False)
 
         # Compress result directory
         archive_name = job["archive_name"]
@@ -1248,62 +1295,33 @@ def _resume_archive_job(job_id: str):
 
         os.makedirs(result_dir, exist_ok=True)
 
-        # Process remaining files
+        # Collect remaining files
+        remaining_files = []
         for root, dirs, files in os.walk(extract_dir):
             for filename in files:
                 file_path = os.path.join(root, filename)
                 rel_path = os.path.relpath(file_path, extract_dir)
+                if rel_path not in processed:
+                    remaining_files.append(file_path)
 
-                if rel_path in processed:
-                    continue
+        # Split into batches of BATCH_SIZE
+        chunks = [remaining_files[i:i + BATCH_SIZE] for i in range(0, len(remaining_files), BATCH_SIZE)]
+        print(f"[archive] Resume {job_id}: {len(remaining_files)} remaining, {len(chunks)} batches, {MAX_CONCURRENT_BATCHES} concurrent")
 
-                rel_no_ext, ext = os.path.splitext(rel_path)
-                md_rel_path = rel_no_ext + ".md"
-                json_rel_path = rel_no_ext + ".json"
-                md_abs_path = os.path.join(result_dir, md_rel_path)
-                json_abs_path = os.path.join(result_dir, json_rel_path)
+        manifest_lock = threading.Lock()
 
-                entry = {
-                    "original_relative_path": rel_path,
-                    "md_relative_path": md_rel_path,
-                    "layout_relative_path": json_rel_path,
-                    "status": "success",
-                    "message": "",
-                }
+        def _run_batch(batch_files):
+            for file_path in batch_files:
+                entry = _process_archive_file(job_id, file_path, result_dir, extract_dir, manifest_path)
+                with manifest_lock:
+                    archive_store.append_manifest_entry(job_id, entry)
+                    _write_manifest(manifest_path, job_id)
 
-                try:
-                    os.makedirs(os.path.dirname(md_abs_path), exist_ok=True)
-                    req = LayoutParsingRequest(filePath=file_path)
-                    result = process_single_file(req)
-
-                    md_text = ""
-                    for page in result.get("result", {}).get("layoutParsingResults", []):
-                        page_md = page.get("markdown", {}).get("text", "")
-                        if page_md:
-                            md_text += page_md + "\n\n"
-
-                    with open(md_abs_path, "w", encoding="utf-8") as f:
-                        f.write(md_text)
-
-                    data_type = result.get("result", {}).get("dataInfo", {}).get("type", "")
-                    if data_type != "markitdown":
-                        with open(json_abs_path, "w", encoding="utf-8") as f:
-                            json.dump(
-                                result["result"]["layoutParsingResults"],
-                                f, ensure_ascii=False, indent=2,
-                            )
-                    else:
-                        entry["layout_relative_path"] = ""
-
-                except Exception as e:
-                    traceback.print_exc()
-                    entry["status"] = "failed"
-                    entry["message"] = str(e)
-                    entry["md_relative_path"] = ""
-                    entry["layout_relative_path"] = ""
-
-                archive_store.append_manifest_entry(job_id, entry)
-                _write_manifest(manifest_path, job_id)
+        batch_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_BATCHES)
+        futures = [batch_executor.submit(_run_batch, chunk) for chunk in chunks]
+        for f in futures:
+            f.result()
+        batch_executor.shutdown(wait=False)
 
     # Compress and finalize (same as _process_archive_job)
     try:
