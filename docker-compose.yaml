@@ -3,18 +3,19 @@
 #   1) 仅启动本服务（默认，AI Studio 托管模式或连外部 vLLM）：
 #        cp .env.example .env   # 按需填写 AI_STUDIO_TOKEN
 #        docker compose up -d --build
-#   2) 连同 vLLM（GPU）一起启动：
-#        docker compose --profile vllm up -d --build
+#   2) 需要内置 vLLM（GPU）时：取消下面 vllm 服务注释后重新 up -d
 #
 # 获取管理员 token（所有接口需 Bearer 鉴权，包括 /health）：
 #       docker compose logs layout-server | grep "Admin token"
 #
 # 健康检查使用 TCP 探测（/health 也在鉴权之下，无法无 token HTTP 探测）。
 #
-# 兼容性说明：为避免旧版 compose（docker-compose v1）不支持
-# "${VAR:-default}" 插值语法导致报错，这里不写带默认值的插值；
-# 常规配置直接写明文，需要覆盖时改对应行即可。
-# .env 中仅支持 AI_STUDIO_TOKEN（空值 = 走本地 vLLM 模式）。
+# 兼容性说明：
+#   - version 声明为 3.8，兼容 docker-compose v1（v1.22+）与 v2；
+#   - 不使用 "${VAR:-default}" 插值（v1 旧版不支持），常规配置写明文；
+#   - .env 仅透传 AI_STUDIO_TOKEN（空值 = 走本地 vLLM 模式）。
+
+version: "3.8"
 
 services:
   layout-server:
@@ -27,7 +28,7 @@ services:
     environment:
       PORT: "8399"
       # —— 二选一：本地 vLLM 模式 ——
-      # 默认指向 compose 内置 vllm 服务（--profile vllm）；
+      # 默认指向内置 vllm 服务（取消注释 vllm 服务后生效）；
       # 连外部 vLLM 时改成 http://your-vllm-host:8000/v1
       VLLM_SERVER_URL: http://vllm:8000/v1
       # —— 二选一：AI Studio 托管模式（配置后优先，无需 vLLM）——
@@ -56,23 +57,22 @@ services:
     restart: unless-stopped
 
   # 可选：内置 vLLM（PaddleOCR-VL），需要 NVIDIA GPU + nvidia-container-toolkit。
-  # 启动：docker compose --profile vllm up -d --build
-  vllm:
-    image: vllm/vllm-openai:latest
-    profiles: ["vllm"]
-    command: ["PaddlePaddle/PaddleOCR-VL", "--trust-remote-code", "--max-num-batched-tokens", "16384", "--no-enable-prefix-caching"]
-    ports:
-      - "8000:8000"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
+  # 需要时取消注释，然后：docker compose up -d --build
+  # vllm:
+  #   image: vllm/vllm-openai:latest
+  #   command: ["PaddlePaddle/PaddleOCR-VL", "--trust-remote-code", "--max-num-batched-tokens", "16384", "--no-enable-prefix-caching"]
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ~/.cache/huggingface:/root/.cache/huggingface
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   restart: unless-stopped
 
 volumes:
   layout-data:

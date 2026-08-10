@@ -259,8 +259,7 @@ cp .env.example .env
 # 仅启动本服务（默认；连接外部 vLLM 或 AI Studio 托管）
 docker compose up -d --build
 
-# 连同内置 vLLM（GPU）一起启动
-docker compose --profile vllm up -d --build
+# 需要内置 vLLM（GPU）时：取消 docker-compose.yaml 中 vllm 服务注释后重跑
 ```
 
 ### 3. 获取访问令牌
@@ -285,9 +284,9 @@ curl http://localhost:8399/layout-parsing \
 
 - **健康检查**：容器内采用 TCP 探测（`/health` 也在鉴权之下，无法无 token 探测）。
 - **持久化**：`layout-data` 卷（uploads / 任务 / user.json）与 `paddlex-models` 卷（Paddle 模型缓存，首次本地模式运行下载 ~125MB）。
-- **配置覆盖**：为兼容旧版 `docker-compose`（v1 不支持 `${VAR:-default}` 插值），端口与常规配置直接写在 compose 文件中，需要覆盖时修改对应行；`.env` 仅透传 `AI_STUDIO_TOKEN`。
+- **配置覆盖**：为兼容旧版 `docker-compose`（v1 不支持 `${VAR:-default}` 插值和 `profiles`），文件声明 `version: "3.8"`，端口与常规配置直接写在 compose 文件中（需要覆盖时修改对应行）；`.env` 仅透传 `AI_STUDIO_TOKEN`。内置 vLLM 以注释形式保留，取消注释即可启用（需 NVIDIA GPU + `nvidia-container-toolkit`）。
 - **重启 token 失效**：若修改了 `JWT_SECRET`，旧 token 全部失效；建议改成随机长字符串后保持稳定。
-- **内置 vLLM**：需要 NVIDIA GPU + `nvidia-container-toolkit`，模型名/参数可按实际环境修改 compose 中 `vllm` 服务。
+- **升级建议**：你的报错来自旧版 `docker-compose`（v1）。建议优先升级到 v2（`docker compose` 子命令，随 Docker Desktop / docker-ce 内置），新版对 `${VAR:-default}` 插值、`profiles` 等支持更完整。
 
 ## Verified Compatibility
 
