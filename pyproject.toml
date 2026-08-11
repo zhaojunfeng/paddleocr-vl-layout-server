@@ -15,6 +15,7 @@ dependencies = [
     "markitdown[all]>=0.1",
     "PyJWT>=2.8",
     "requests>=2.25",
+    "python-multipart",
 ]
 
 [tool.setuptools]
